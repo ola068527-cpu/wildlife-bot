@@ -1,0 +1,9 @@
+services:
+  - type: worker
+    name: wildlife-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python wildlife_bot.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
