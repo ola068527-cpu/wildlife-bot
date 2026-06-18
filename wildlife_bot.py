@@ -256,6 +256,8 @@ def process_video(url, chat_id, bot, custom_name=None):
             clip_mb = os.path.getsize(clip) / (1024 * 1024)
             success = False
             for attempt in range(5):  # up to 5 attempts per clip
+                if cancel_flags.get(chat_id):
+                    break
                 try:
                     with open(clip, "rb") as f:
                         run(bot.send_video(
@@ -275,7 +277,13 @@ def process_video(url, chat_id, bot, custom_name=None):
                     wait = (attempt + 1) * 10  # 10s, 20s, 30s, 40s, 50s
                     edit_msg(bot, chat_id, msg_id,
                         f"⏳ Clip {i}/{len(clips)} attempt {attempt+1} failed, retrying in {wait}s...\n_{err}_")
-                    time.sleep(wait)
+                    for _ in range(wait):
+                        if cancel_flags.get(chat_id):
+                            break
+                        time.sleep(1)
+
+            if cancel_flags.get(chat_id):
+                break
 
             if not success:
                 send_msg(bot, chat_id, f"❌ Clip {i} could not be sent after 5 attempts. Skipping.", parse_mode=None)
@@ -284,7 +292,10 @@ def process_video(url, chat_id, bot, custom_name=None):
             except: pass
 
             edit_msg(bot, chat_id, msg_id, f"📤 Progress: {i}/{len(clips)} clips processed...")
-            time.sleep(3)  # 3s pause between clips to avoid rate limiting
+            for _ in range(3):  # 3s pause between clips, interruptible by /cancel
+                if cancel_flags.get(chat_id):
+                    break
+                time.sleep(1)
 
         if cancel_flags.get(chat_id):
             cancel_flags.pop(chat_id, None)
@@ -366,6 +377,8 @@ async def download(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"No video #{video_id}. Use /list.")
             return
         v = VIDEOS[video_id]
+        active_downloads[chat_id] = v["name"]  # claim immediately — closes the race with /cancel & duplicate updates
+        cancel_flags.pop(chat_id, None)
         threading.Thread(target=process_video, args=(v["url"], chat_id, bot), daemon=True).start()
         return
 
@@ -385,6 +398,8 @@ async def download(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Any URL — let yt-dlp handle it
     if arg.startswith("http"):
+        active_downloads[chat_id] = arg[:60]  # claim immediately — closes the race with /cancel & duplicate updates
+        cancel_flags.pop(chat_id, None)
         threading.Thread(target=process_video, args=(arg, chat_id, bot), daemon=True).start()
         return
 
@@ -410,6 +425,9 @@ async def download_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"📥 Found *{len(results)} videos*. Processing one by one... ⏳", parse_mode="Markdown")
 
+    active_downloads[chat_id] = f"batch of {len(results)} videos"  # claim immediately
+    cancel_flags.pop(chat_id, None)
+
     def batch():
         for i, (file_url, filename) in enumerate(results, 1):
             if cancel_flags.get(chat_id):
@@ -417,25 +435,36 @@ async def download_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 active_downloads.pop(chat_id, None)
                 run(bot.send_message(chat_id=chat_id, text="🛑 Batch cancelled."))
                 return
+            active_downloads[chat_id] = f"batch {i}/{len(results)}: {filename}"  # re-claim each round
+            cancel_flags.pop(chat_id, None)
             run(bot.send_message(chat_id=chat_id, text=f"📹 *Video {i}/{len(results)}:* {filename}", parse_mode="Markdown"))
             process_video(file_url, chat_id, bot)
+        active_downloads.pop(chat_id, None)
         run(bot.send_message(chat_id=chat_id, text=f"🎉 *All done!* Finished all {len(results)} videos.", parse_mode="Markdown"))
 
     threading.Thread(target=batch, daemon=True).start()
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    if chat_id in active_downloads or chat_id in active_processes:
-        cancel_flags[chat_id] = True
-        # Kill yt-dlp process immediately if running
-        proc = active_processes.get(chat_id)
-        if proc:
+    was_busy = chat_id in active_downloads or chat_id in active_processes
+
+    # Always set the flag and clear state, even if the dicts look empty right
+    # now — a send/retry loop running in another thread may flip them a
+    # moment later, and we don't want a timing gap to make /cancel a no-op.
+    cancel_flags[chat_id] = True
+    proc = active_processes.get(chat_id)
+    if proc:
+        try:
             proc.kill()
-            active_processes.pop(chat_id, None)
-        active_downloads.pop(chat_id, None)
+        except Exception:
+            pass
+        active_processes.pop(chat_id, None)
+    active_downloads.pop(chat_id, None)
+
+    if was_busy:
         await update.message.reply_text("🛑 *Cancelled!*", parse_mode="Markdown")
     else:
-        await update.message.reply_text("✅ Nothing to cancel.")
+        await update.message.reply_text("✅ Nothing was tracked as active, but I've sent a stop signal just in case anything is still running in the background.")
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
