@@ -15,6 +15,7 @@ COMMANDS:
 /status        - Check download status
 /subscribe     - Subscribe (₦3,000 / 14 days)
 /verify        - Verify payment & activate subscription
+/menu          - Show button menu
 """
 
 import os
@@ -27,8 +28,8 @@ import threading
 import asyncio
 import requests
 from datetime import datetime, timedelta
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 
 BOT_TOKEN = "8918950077:AAFH8Siv7UA-kh99KQyvNyMer_apo3zdRe8"
 
@@ -45,6 +46,12 @@ SUBSCRIPTION_AMOUNT_KOBO = 300000  # ₦3,000
 SUBSCRIPTION_PERIOD_DAYS = 14
 DB_PATH = os.environ.get("DB_PATH", "/tmp/wildlife/subscribers.db")  # set to a path on the
 # Render persistent disk in production so this survives redeploys
+
+# Admin chat IDs (comma-separated in env) — these bypass the subscription gate entirely
+ADMIN_CHAT_IDS = set(
+    int(x) for x in os.environ.get("ADMIN_CHAT_IDS", "").split(",") if x.strip()
+)
+CONTACT_USERNAME = "blackoutstories"  # shown as a "Contact Admin" button
 
 VIDEOS = {
     1:  {"name": "Ice Fox - Arctic Survival",            "url": "https://archive.org/download/Natural_History_Wildlife/Nature%201993%20-%20Ice%20Fox.mp4"},
@@ -134,6 +141,8 @@ def db_all_active_due(now_iso):
     return [dict(zip(SUB_COLUMNS, r)) for r in rows]
 
 def is_active_subscriber(chat_id):
+    if chat_id in ADMIN_CHAT_IDS:
+        return True
     row = db_get(chat_id)
     return bool(row and row.get("active"))
 
@@ -483,27 +492,45 @@ def resolve_archive_collection(url):
         return None
 
 
+# ── Button menu ─────────────────────────────────────────────────────────────
+
+HELP_TEXT = (
+    "🎬 *Video Downloader Bot*\n\n"
+    "Download from *1000+ sites* — Vimeo, archive.org, Dailymotion, Facebook, TikTok, Twitter & more!\n"
+    "Videos are split into *2-minute clips* and sent directly to you here.\n\n"
+    "📋 *Commands:*\n"
+    "/dl <url> — Download any video URL\n"
+    "/dl 3 — Download built-in wildlife video #3\n"
+    "/list — See built-in wildlife videos\n"
+    "/dlall <archive.org url> — Download whole collection\n"
+    "/cancel — Cancel active download\n"
+    "/status — Check progress\n"
+    "/subscribe — Subscribe (₦3,000 / 14 days)\n"
+    "/verify — Verify payment & activate\n\n"
+    "*Examples:*\n"
+    "`/dl https://vimeo.com/123456789`\n"
+    "`/dl https://archive.org/details/ElephantsDream`"
+)
+
+def main_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 List Videos", callback_data="menu_list"),
+         InlineKeyboardButton("⬇️ Download", callback_data="menu_dl")],
+        [InlineKeyboardButton("💳 Subscribe", callback_data="menu_subscribe"),
+         InlineKeyboardButton("📊 Status", callback_data="menu_status")],
+        [InlineKeyboardButton("🛑 Cancel", callback_data="menu_cancel"),
+         InlineKeyboardButton("ℹ️ Help", callback_data="menu_help")],
+        [InlineKeyboardButton("📬 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}")],
+    ])
+
+
 # ── Command handlers ───────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🎬 *Video Downloader Bot*\n\n"
-        "Download from *1000+ sites* — Vimeo, archive.org, Dailymotion, Facebook, TikTok, Twitter & more!\n"
-        "Videos are split into *2-minute clips* and sent directly to you here.\n\n"
-        "📋 *Commands:*\n"
-        "/dl <url> — Download any video URL\n"
-        "/dl 3 — Download built-in wildlife video #3\n"
-        "/list — See built-in wildlife videos\n"
-        "/dlall <archive.org url> — Download whole collection\n"
-        "/cancel — Cancel active download\n"
-        "/status — Check progress\n"
-        "/subscribe — Subscribe (₦3,000 / 14 days)\n"
-        "/verify — Verify payment & activate\n\n"
-        "*Examples:*\n"
-        "`/dl https://vimeo.com/123456789`\n"
-        "`/dl https://archive.org/details/ElephantsDream`",
-        parse_mode="Markdown"
-    )
+    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📋 *Main Menu*", parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
 async def list_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = "📹 *Built-in Wildlife Videos:*\n\n"
@@ -514,6 +541,9 @@ async def list_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    if chat_id in ADMIN_CHAT_IDS:
+        await update.message.reply_text("👑 You're an admin — you already have full access, no subscription needed.")
+        return
     if not PAYSTACK_SECRET_KEY:
         await update.message.reply_text("⚠️ Billing isn't configured yet. Try again later.")
         return
@@ -708,6 +738,64 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("✅ No active downloads.")
 
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    data = query.data
+
+    if data == "menu_list":
+        msg = "📹 *Built-in Wildlife Videos:*\n\n"
+        for num, v in VIDEOS.items():
+            msg += f"*{num}.* {v['name']}\n"
+        msg += "\nDownload: /dl <number>"
+        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+
+    elif data == "menu_dl":
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "⬇️ *Download*\n\nSend:\n"
+                "`/dl <url>` — any supported site\n"
+                "`/dl <number>` — built-in video (see 📋 List Videos)\n"
+                "`/dlall <archive.org url>` — whole collection"
+            ),
+            parse_mode="Markdown")
+
+    elif data == "menu_subscribe":
+        if chat_id in ADMIN_CHAT_IDS:
+            text = "👑 You're an admin — full access, no subscription needed."
+        elif is_active_subscriber(chat_id):
+            row = db_get(chat_id)
+            text = f"✅ You're already subscribed.\nNext charge: {(row.get('next_charge_at') or '')[:10]}"
+        else:
+            text = "💳 *Subscribe — ₦3,000 every 14 days*\n\nSend:\n`/subscribe you@example.com`"
+        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+
+    elif data == "menu_status":
+        if chat_id in active_downloads:
+            text = f"⏳ Working on: *{active_downloads[chat_id]}*"
+        else:
+            text = "✅ No active downloads."
+        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+
+    elif data == "menu_cancel":
+        was_busy = chat_id in active_downloads or chat_id in active_processes
+        cancel_flags[chat_id] = True
+        proc = active_processes.get(chat_id)
+        if proc:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            active_processes.pop(chat_id, None)
+        active_downloads.pop(chat_id, None)
+        text = "🛑 *Cancelled!*" if was_busy else "✅ Nothing was active, but a stop signal was sent just in case."
+        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+
+    elif data == "menu_help":
+        await context.bot.send_message(chat_id=chat_id, text=HELP_TEXT, parse_mode="Markdown")
+
 
 # ── Run ────────────────────────────────────────────────────────────────────
 
@@ -741,6 +829,11 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("subscribe", subscribe))
     app.add_handler(CommandHandler("verify", verify))
+    app.add_handler(CommandHandler("menu", menu))
+    app.add_handler(CallbackQueryHandler(button_handler))
+
+    if ADMIN_CHAT_IDS:
+        print(f"👑 Admin bypass active for chat IDs: {sorted(ADMIN_CHAT_IDS)}")
 
     threading.Thread(target=billing_loop, daemon=True).start()
 

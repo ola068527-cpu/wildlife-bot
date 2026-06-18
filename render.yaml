@@ -11,6 +11,8 @@ services:
         sync: false
       - key: DB_PATH
         value: /var/data/subscribers.db
+      - key: ADMIN_CHAT_IDS
+        value: "7952834563"
     disk:
       name: wildlife-bot-data
       mountPath: /var/data
