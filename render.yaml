@@ -7,3 +7,11 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
+      - key: PAYSTACK_SECRET_KEY
+        sync: false
+      - key: DB_PATH
+        value: /var/data/subscribers.db
+    disk:
+      name: wildlife-bot-data
+      mountPath: /var/data
+      sizeGB: 1

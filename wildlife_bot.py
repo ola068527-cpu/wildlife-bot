@@ -13,15 +13,20 @@ COMMANDS:
 /dlall <url>   - Download entire archive.org collection
 /cancel        - Cancel active download
 /status        - Check download status
+/subscribe     - Subscribe (₦3,000 / 14 days)
+/verify        - Verify payment & activate subscription
 """
 
 import os
 import re
 import json
+import time
+import sqlite3
 import subprocess
 import threading
 import asyncio
 import requests
+from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
@@ -32,6 +37,14 @@ os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
 CLIP_DURATION = 120  # 2 minutes per clip
 TELEGRAM_MAX_MB = 50
+
+# ── Paystack billing config ─────────────────────────────────────────────
+PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY", "")
+PAYSTACK_BASE = "https://api.paystack.co"
+SUBSCRIPTION_AMOUNT_KOBO = 300000  # ₦3,000
+SUBSCRIPTION_PERIOD_DAYS = 14
+DB_PATH = os.environ.get("DB_PATH", "/tmp/wildlife/subscribers.db")  # set to a path on the
+# Render persistent disk in production so this survives redeploys
 
 VIDEOS = {
     1:  {"name": "Ice Fox - Arctic Survival",            "url": "https://archive.org/download/Natural_History_Wildlife/Nature%201993%20-%20Ice%20Fox.mp4"},
@@ -51,6 +64,148 @@ active_downloads = {}
 cancel_flags = {}
 active_processes = {}  # stores yt-dlp subprocess so cancel can kill it
 bot_loop = None
+bot_instance = None  # set in __main__, used by the billing thread
+
+
+# ── Subscriber store (sqlite) ───────────────────────────────────────────
+
+SUB_COLUMNS = ["chat_id", "email", "authorization_code", "reference", "active", "next_charge_at", "created_at"]
+db_lock = threading.Lock()
+
+def db_init():
+    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS subscribers (
+                    chat_id INTEGER PRIMARY KEY,
+                    email TEXT,
+                    authorization_code TEXT,
+                    reference TEXT,
+                    active INTEGER DEFAULT 0,
+                    next_charge_at TEXT,
+                    created_at TEXT
+                )
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+def db_get(chat_id):
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            cur = conn.execute(f"SELECT {','.join(SUB_COLUMNS)} FROM subscribers WHERE chat_id=?", (chat_id,))
+            row = cur.fetchone()
+        finally:
+            conn.close()
+    return dict(zip(SUB_COLUMNS, row)) if row else None
+
+def db_save(chat_id, **fields):
+    current = db_get(chat_id) or {c: None for c in SUB_COLUMNS}
+    current["chat_id"] = chat_id
+    current.update(fields)
+    if not current.get("created_at"):
+        current["created_at"] = datetime.utcnow().isoformat()
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            placeholders = ",".join("?" for _ in SUB_COLUMNS)
+            conn.execute(
+                f"INSERT OR REPLACE INTO subscribers ({','.join(SUB_COLUMNS)}) VALUES ({placeholders})",
+                [current[c] for c in SUB_COLUMNS]
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+def db_all_active_due(now_iso):
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            cur = conn.execute(
+                f"SELECT {','.join(SUB_COLUMNS)} FROM subscribers WHERE active=1 AND next_charge_at<=?",
+                (now_iso,)
+            )
+            rows = cur.fetchall()
+        finally:
+            conn.close()
+    return [dict(zip(SUB_COLUMNS, r)) for r in rows]
+
+def is_active_subscriber(chat_id):
+    row = db_get(chat_id)
+    return bool(row and row.get("active"))
+
+
+# ── Paystack helpers ─────────────────────────────────────────────────────
+
+def paystack_headers():
+    return {"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}", "Content-Type": "application/json"}
+
+def paystack_initialize(email, chat_id):
+    reference = f"wildlife_{chat_id}_{int(time.time())}"
+    payload = {
+        "email": email,
+        "amount": SUBSCRIPTION_AMOUNT_KOBO,
+        "reference": reference,
+        "channels": ["card"],
+        "metadata": {"chat_id": chat_id},
+    }
+    r = requests.post(f"{PAYSTACK_BASE}/transaction/initialize", json=payload, headers=paystack_headers(), timeout=20)
+    data = r.json()
+    if not data.get("status"):
+        raise RuntimeError(data.get("message", "Paystack initialize failed"))
+    return reference, data["data"]["authorization_url"]
+
+def paystack_verify(reference):
+    r = requests.get(f"{PAYSTACK_BASE}/transaction/verify/{reference}", headers=paystack_headers(), timeout=20)
+    data = r.json()
+    if not data.get("status"):
+        raise RuntimeError(data.get("message", "Paystack verify failed"))
+    return data["data"]  # {status, authorization:{authorization_code, reusable}, customer:{email}}
+
+def paystack_charge(authorization_code, email):
+    payload = {"authorization_code": authorization_code, "email": email, "amount": SUBSCRIPTION_AMOUNT_KOBO}
+    r = requests.post(f"{PAYSTACK_BASE}/transaction/charge_authorization", json=payload, headers=paystack_headers(), timeout=30)
+    return r.json()
+
+
+def billing_loop():
+    """Background thread: every hour, charges any subscriber whose 14-day
+    cycle is due, using their saved card authorization."""
+    while bot_loop is None:  # wait for post_init to set the event loop
+        time.sleep(1)
+    while True:
+        try:
+            now_iso = datetime.utcnow().isoformat()
+            for sub in db_all_active_due(now_iso):
+                chat_id = sub["chat_id"]
+                try:
+                    result = paystack_charge(sub["authorization_code"], sub["email"])
+                    if result.get("data", {}).get("status") == "success":
+                        next_charge = (datetime.utcnow() + timedelta(days=SUBSCRIPTION_PERIOD_DAYS)).isoformat()
+                        db_save(chat_id, active=1, next_charge_at=next_charge)
+                        run(bot_instance.send_message(
+                            chat_id=chat_id,
+                            text=f"✅ *Renewed!* ₦3,000 charged. Next renewal: {next_charge[:10]}",
+                            parse_mode="Markdown"))
+                    else:
+                        db_save(chat_id, active=0)
+                        run(bot_instance.send_message(
+                            chat_id=chat_id,
+                            text="❌ Your renewal payment failed. Use /subscribe to reactivate."))
+                except Exception as e:
+                    db_save(chat_id, active=0)
+                    try:
+                        run(bot_instance.send_message(
+                            chat_id=chat_id,
+                            text=f"❌ Renewal failed: {e}. Use /subscribe to reactivate."))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        time.sleep(3600)  # check hourly
 
 
 # ── Event loop fix ─────────────────────────────────────────────────────────
@@ -245,7 +400,6 @@ def process_video(url, chat_id, bot, custom_name=None):
             return
 
         # ── Step 4: Send clips ──
-        import time
         sent = 0
         edit_msg(bot, chat_id, msg_id, f"📤 Sending *{len(clips)} clips*... ⏳")
         for i, clip in enumerate(clips, 1):
@@ -342,7 +496,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/list — See built-in wildlife videos\n"
         "/dlall <archive.org url> — Download whole collection\n"
         "/cancel — Cancel active download\n"
-        "/status — Check progress\n\n"
+        "/status — Check progress\n"
+        "/subscribe — Subscribe (₦3,000 / 14 days)\n"
+        "/verify — Verify payment & activate\n\n"
         "*Examples:*\n"
         "`/dl https://vimeo.com/123456789`\n"
         "`/dl https://archive.org/details/ElephantsDream`",
@@ -356,9 +512,83 @@ async def list_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg += "\nDownload: /dl <number>"
     await update.message.reply_text(msg, parse_mode="Markdown")
 
+async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not PAYSTACK_SECRET_KEY:
+        await update.message.reply_text("⚠️ Billing isn't configured yet. Try again later.")
+        return
+
+    row = db_get(chat_id)
+    if row and row.get("active"):
+        await update.message.reply_text(
+            f"✅ You're already subscribed.\nNext charge: {(row.get('next_charge_at') or '')[:10]}",
+            parse_mode="Markdown")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "💳 *Subscribe — ₦3,000 every 14 days*\n\n"
+            "Reply with your email like this:\n`/subscribe you@example.com`",
+            parse_mode="Markdown")
+        return
+
+    email = context.args[0]
+    if "@" not in email or "." not in email:
+        await update.message.reply_text("❌ That doesn't look like a valid email. Try `/subscribe you@example.com`", parse_mode="Markdown")
+        return
+
+    try:
+        reference, pay_url = paystack_initialize(email, chat_id)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Couldn't start payment: {e}")
+        return
+
+    db_save(chat_id, email=email, reference=reference, active=0)
+    await update.message.reply_text(
+        f"💳 *Tap to pay ₦3,000:*\n{pay_url}\n\n"
+        f"After paying, send /verify to activate your subscription.",
+        parse_mode="Markdown")
+
+async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    row = db_get(chat_id)
+    if not row or not row.get("reference"):
+        await update.message.reply_text("❌ No pending payment found. Use /subscribe first.")
+        return
+
+    try:
+        data = paystack_verify(row["reference"])
+    except Exception as e:
+        await update.message.reply_text(f"❌ Couldn't verify payment: {e}")
+        return
+
+    if data.get("status") != "success":
+        await update.message.reply_text(f"⏳ Payment not completed yet (status: {data.get('status')}). Pay first, then /verify again.")
+        return
+
+    auth = data.get("authorization", {})
+    if not auth.get("reusable"):
+        await update.message.reply_text("⚠️ This payment method can't be auto-renewed. Please pay with a card so renewals work, then /subscribe again.")
+        return
+
+    next_charge = (datetime.utcnow() + timedelta(days=SUBSCRIPTION_PERIOD_DAYS)).isoformat()
+    db_save(chat_id,
+            email=data.get("customer", {}).get("email", row.get("email")),
+            authorization_code=auth.get("authorization_code"),
+            active=1,
+            next_charge_at=next_charge)
+    await update.message.reply_text(
+        f"✅ *Subscribed!* You're all set.\nNext charge: {next_charge[:10]}\n\nUse /dl to start downloading.",
+        parse_mode="Markdown")
+
 async def download(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     bot = context.bot
+
+    if not is_active_subscriber(chat_id):
+        await update.message.reply_text(
+            "🔒 This bot requires an active subscription (₦3,000 / 14 days).\nUse /subscribe to get started.")
+        return
 
     if not context.args:
         await update.message.reply_text("Usage: /dl <url>  or  /dl <number>\nExamples:\n`/dl https://vimeo.com/123456`\n`/dl 1`", parse_mode="Markdown")
@@ -408,6 +638,11 @@ async def download(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def download_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     bot = context.bot
+
+    if not is_active_subscriber(chat_id):
+        await update.message.reply_text(
+            "🔒 This bot requires an active subscription (₦3,000 / 14 days).\nUse /subscribe to get started.")
+        return
 
     if not context.args:
         await update.message.reply_text("Usage: /dlall <archive.org url>")
@@ -486,16 +721,27 @@ if __name__ == "__main__":
 
     print("🎬 Video Downloader Bot starting...")
     print("Supports: Vimeo, archive.org, Dailymotion, Facebook, TikTok, Twitter & 1000+ more")
+
+    db_init()
+    if not PAYSTACK_SECRET_KEY:
+        print("⚠️  PAYSTACK_SECRET_KEY not set — /subscribe will be disabled until it's configured.")
+
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .post_init(post_init)
         .build()
     )
+    bot_instance = app.bot
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("list", list_videos))
     app.add_handler(CommandHandler("dl", download))
     app.add_handler(CommandHandler("dlall", download_all))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("subscribe", subscribe))
+    app.add_handler(CommandHandler("verify", verify))
+
+    threading.Thread(target=billing_loop, daemon=True).start()
+
     app.run_polling()
