@@ -113,6 +113,7 @@ def ytdlp_download(url, output_path, chat_id, bot, msg_id):
     cmd = [
         "yt-dlp",
         "--no-playlist",
+        "-f", "bv*[height<=720]+ba/b[height<=720]/best",  # cap resolution — keeps memory/disk use low
         "--merge-output-format", "mp4",
         "--newline",
         "-o", output_path,
@@ -150,10 +151,13 @@ def ytdlp_download(url, output_path, chat_id, bot, msg_id):
 def split_video(filepath):
     base = os.path.splitext(filepath)[0]
     pattern = f"{base}_clip_%03d.mp4"
+
+    # Step 1: split with stream COPY — no re-encoding, near-zero memory/CPU.
+    # Re-encoding a 20-30 min file in one ffmpeg pass is what was running the
+    # bot out of memory (512MB plan). Copying just demuxes/remuxes instead.
     cmd = [
         "ffmpeg", "-i", filepath,
-        "-c:v", "libx264", "-crf", "28",   # compress video (smaller = faster upload)
-        "-c:a", "aac", "-b:a", "96k",      # compress audio
+        "-c", "copy",
         "-segment_time", str(CLIP_DURATION),
         "-f", "segment", "-reset_timestamps", "1",
         pattern, "-y"
@@ -164,7 +168,31 @@ def split_video(filepath):
         for f in os.listdir(os.path.dirname(filepath))
         if os.path.basename(base) + "_clip_" in f and f.endswith(".mp4")
     ])
-    return clips
+
+    # Step 2: only re-encode clips that are still too big for Telegram, one
+    # short 2-minute clip at a time (low memory) instead of the whole video.
+    final_clips = []
+    for clip in clips:
+        size_mb = os.path.getsize(clip) / (1024 * 1024)
+        if size_mb <= TELEGRAM_MAX_MB:
+            final_clips.append(clip)
+            continue
+        compressed = clip.replace(".mp4", "_c.mp4")
+        compress_cmd = [
+            "ffmpeg", "-i", clip,
+            "-c:v", "libx264", "-crf", "30", "-preset", "veryfast", "-threads", "1",
+            "-vf", "scale=-2:720",
+            "-c:a", "aac", "-b:a", "96k",
+            compressed, "-y"
+        ]
+        subprocess.run(compress_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if os.path.exists(compressed) and os.path.getsize(compressed) > 0:
+            try: os.remove(clip)
+            except: pass
+            final_clips.append(compressed)
+        else:
+            final_clips.append(clip)  # fallback to original if compression failed
+    return final_clips
 
 
 # ── Core process: download → split → send ─────────────────────────────────
