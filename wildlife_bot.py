@@ -31,7 +31,7 @@ from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_TOKEN = "8918950077:AAFH8Siv7UA-kh99KQyvNyMer_apo3zdRe8"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
 DOWNLOAD_FOLDER = "/tmp/wildlife"
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
@@ -287,10 +287,15 @@ def ytdlp_download(url, output_path, chat_id, bot, msg_id):
     active_processes[chat_id] = proc
 
     last_percent = -1
+    error_lines = []  # keep yt-dlp's own ERROR/WARNING lines so failures are diagnosable
     for line in proc.stdout:
         if cancel_flags.get(chat_id):
             proc.kill()
-            return False
+            return False, ""
+
+        if "ERROR" in line or "WARNING" in line:
+            error_lines.append(line.strip())
+            print(f"[yt-dlp] {line.strip()}")  # always show up in Render logs
 
         # Parse yt-dlp progress lines like: [download]  45.2% of 120.00MiB at 2.50MiB/s
         match = re.search(r"\[download\]\s+([\d.]+)%\s+of\s+([\d.]+)(\w+)\s+at\s+([\d.]+\w+/s)", line)
@@ -307,7 +312,8 @@ def ytdlp_download(url, output_path, chat_id, bot, msg_id):
 
     proc.wait()
     active_processes.pop(chat_id, None)
-    return proc.returncode == 0
+    error_text = "\n".join(l for l in error_lines if "ERROR" in l)[:500]
+    return proc.returncode == 0, error_text
 
 
 # ── Split video into clips ─────────────────────────────────────────────────
@@ -379,7 +385,7 @@ def process_video(url, chat_id, bot, custom_name=None):
         active_downloads[chat_id] = title
 
         # ── Step 2: Download ──
-        success = ytdlp_download(url, filepath, chat_id, bot, msg_id)
+        success, error_text = ytdlp_download(url, filepath, chat_id, bot, msg_id)
 
         if cancel_flags.get(chat_id):
             cancel_flags.pop(chat_id, None)
@@ -388,7 +394,8 @@ def process_video(url, chat_id, bot, custom_name=None):
             return
 
         if not success or not os.path.exists(filepath):
-            edit_msg(bot, chat_id, msg_id, "❌ Download failed. The URL may not be supported or the video is private.")
+            reason = f"\n\n_Reason:_ `{error_text}`" if error_text else ""
+            edit_msg(bot, chat_id, msg_id, f"❌ Download failed. The URL may not be supported or the video is private.{reason}")
             return
 
         # ── Step 3: Split ──
@@ -809,6 +816,10 @@ if __name__ == "__main__":
 
     print("🎬 Video Downloader Bot starting...")
     print("Supports: Vimeo, archive.org, Dailymotion, Facebook, TikTok, Twitter & 1000+ more")
+
+    if not BOT_TOKEN:
+        print("❌ BOT_TOKEN not set! Add it as an environment variable and restart.")
+        exit(1)
 
     db_init()
     if not PAYSTACK_SECRET_KEY:
