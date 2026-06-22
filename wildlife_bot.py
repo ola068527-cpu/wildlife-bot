@@ -254,11 +254,19 @@ def send_video_file(bot, chat_id, filepath, caption):
 
 # ── yt-dlp helpers ────────────────────────────────────────────────────────
 
+# Optional cookies file (Render "Secret File") used to get past YouTube's
+# "Sign in to confirm you're not a bot" check. Never committed to git —
+# uploaded directly as a Secret File in Render's dashboard.
+COOKIES_FILE = "/etc/secrets/youtube_cookies.txt"
+
+def _cookie_args():
+    return ["--cookies", COOKIES_FILE] if os.path.exists(COOKIES_FILE) else []
+
 def ytdlp_get_info(url):
     """Get video title and size using yt-dlp without downloading."""
     try:
         result = subprocess.run(
-            ["yt-dlp", "--dump-json", "--no-playlist", url],
+            ["yt-dlp", "--dump-json", "--no-playlist", *_cookie_args(), url],
             capture_output=True, text=True, timeout=30
         )
         if result.returncode == 0:
@@ -280,6 +288,7 @@ def ytdlp_download(url, output_path, chat_id, bot, msg_id):
         "-f", "bv*[height<=720]+ba/b[height<=720]/best",  # cap resolution — keeps memory/disk use low
         "--merge-output-format", "mp4",
         "--newline",
+        *_cookie_args(),
         "-o", output_path,
         url
     ]
